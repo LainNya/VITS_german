@@ -20,6 +20,8 @@ from jamo import h2j, j2hcj
 from pypinyin import lazy_pinyin, BOPOMOFO
 import jieba, cn2an
 from num2words import num2words
+import inflect
+from phonemizer import phonemize
 
 # This is a list of Korean classifiers preceded by pure Korean numerals.
 _korean_classifiers = '군데 권 개 그루 닢 대 두 마리 모 모금 뭇 발 발짝 방 번 벌 보루 살 수 술 시 쌈 움큼 정 짝 채 척 첩 축 켤레 톨 통'
@@ -1384,7 +1386,75 @@ class GermanTransliterate:
             raise e
 
 
+_inflect = inflect.engine()
+_comma_number_re = re.compile(r'([0-9][0-9\,]+[0-9])')
+_decimal_number_re = re.compile(r'([0-9]+\.[0-9]+)')
+_pounds_re = re.compile(r'£([0-9\,]*[0-9]+)')
+_dollars_re = re.compile(r'\$([0-9\.\,]*[0-9]+)')
+_ordinal_re = re.compile(r'[0-9]+(st|nd|rd|th)')
+_number_re = re.compile(r'[0-9]+')
 
+
+def _remove_commas(m):
+  return m.group(1).replace(',', '')
+
+
+def _expand_decimal_point(m):
+  return m.group(1).replace('.', ' point ')
+
+
+def _expand_dollars(m):
+  match = m.group(1)
+  parts = match.split('.')
+  if len(parts) > 2:
+    return match + ' dollars'  # Unexpected format
+  dollars = int(parts[0]) if parts[0] else 0
+  cents = int(parts[1]) if len(parts) > 1 and parts[1] else 0
+  if dollars and cents:
+    dollar_unit = 'dollar' if dollars == 1 else 'dollars'
+    cent_unit = 'cent' if cents == 1 else 'cents'
+    return '%s %s, %s %s' % (dollars, dollar_unit, cents, cent_unit)
+  elif dollars:
+    dollar_unit = 'dollar' if dollars == 1 else 'dollars'
+    return '%s %s' % (dollars, dollar_unit)
+  elif cents:
+    cent_unit = 'cent' if cents == 1 else 'cents'
+    return '%s %s' % (cents, cent_unit)
+  else:
+    return 'zero dollars'
+
+
+def _expand_ordinal(m):
+  return _inflect.number_to_words(m.group(0))
+
+
+def _expand_number(m):
+  num = int(m.group(0))
+  if num > 1000 and num < 3000:
+    if num == 2000:
+      return 'two thousand'
+    elif num > 2000 and num < 2010:
+      return 'two thousand ' + _inflect.number_to_words(num % 100)
+    elif num % 100 == 0:
+      return _inflect.number_to_words(num // 100) + ' hundred'
+    else:
+      return _inflect.number_to_words(num, andword='', zero='oh', group=2).replace(', ', ' ')
+  else:
+    return _inflect.number_to_words(num, andword='')
+
+
+def normalize_numbers(text):
+  text = re.sub(_comma_number_re, _remove_commas, text)
+  text = re.sub(_pounds_re, r'\1 pounds', text)
+  text = re.sub(_dollars_re, _expand_dollars, text)
+  text = re.sub(_decimal_number_re, _expand_decimal_point, text)
+  text = re.sub(_ordinal_re, _expand_ordinal, text)
+  text = re.sub(_number_re, _expand_number, text)
+  return text
+
+
+def expand_numbers(text):
+  return normalize_numbers(text)
 
 def expand_abbreviations(text):
   for regex, replacement in _abbreviations:
@@ -1666,7 +1736,6 @@ def english_cleaners(text):
   phonemes = collapse_whitespace(phonemes)
   return phonemes
 
-
 def english_cleaners2(text):
   '''Pipeline for English text, including abbreviation expansion. + punctuation + stress'''
   text = convert_to_ascii(text)
@@ -1677,5 +1746,43 @@ def english_cleaners2(text):
   return phonemes
 
 def german_cleaners(text):
+   ops = {'accent_peculiarity', 'amount_money', 'date', 'timestamp', 'time_of_day', 'ordinal', 'special'}
    normalized_text = GermanTransliterate(transliterate_ops=ops).transliterate(text)
    return normalized_text
+
+
+def zh_ja_en_de_mixture_cleaners(text):
+  chinese_texts=re.findall(r'\[ZH\].*?\[ZH\]',text)
+  japanese_texts=re.findall(r'\[JA\].*?\[JA\]',text)
+  english_texts=re.findall(r'\[EN\].*?\[EN\]',text)
+  german_texts=re.findall(r'\[DE\].*?\[DE\]',text)
+  for chinese_text in chinese_texts:
+    cleaned_text=number_to_chinese(chinese_text[4:-4])
+    cleaned_text=chinese_to_bopomofo(cleaned_text)
+    cleaned_text=latin_to_bopomofo(cleaned_text)
+    cleaned_text=bopomofo_to_romaji(cleaned_text)
+    cleaned_text=re.sub('i[aoe]',lambda x:'y'+x.group(0)[1:],cleaned_text)
+    cleaned_text=re.sub('u[aoəe]',lambda x:'w'+x.group(0)[1:],cleaned_text)
+    cleaned_text=re.sub('([ʦsɹ]`[⁼ʰ]?)([→↓↑]+)',lambda x:x.group(1)+'ɹ`'+x.group(2),cleaned_text).replace('ɻ','ɹ`')
+    cleaned_text=re.sub('([ʦs][⁼ʰ]?)([→↓↑]+)',lambda x:x.group(1)+'ɹ'+x.group(2),cleaned_text)
+    text = text.replace(chinese_text,cleaned_text+' ',1)
+  for japanese_text in japanese_texts:
+    cleaned_text=japanese_to_romaji_with_accent(japanese_text[4:-4]).replace('ts','ʦ').replace('u','ɯ').replace('...','…')
+    text = text.replace(japanese_text,cleaned_text+' ',1)
+  for english_text in english_texts:
+    cleaned_text = convert_to_ascii(english_text)
+    cleaned_text = lowercase(english_text)
+    cleaned_text = expand_numbers(english_text)
+    cleaned_text = expand_abbreviations(english_text)
+    cleaned_text = phonemize(cleaned_text, language='en-us', backend='espeak', strip=True)
+    cleaned_text = collapse_whitespace(cleaned_text)
+    text = text.replace(english_text,cleaned_text+' ',1)
+  for german_text in german_texts:
+    ops = {'accent_peculiarity', 'amount_money', 'date', 'timestamp', 'time_of_day', 'ordinal', 'special'}
+    cleaned_text= GermanTransliterate(transliterate_ops=ops).transliterate(german_text)
+    cleaned_text = phonemize(cleaned_text, language='de', backend='espeak', strip=True)
+    text = text.replace(german_text,cleaned_text+' ',1)
+  text=text[:-1]
+  if re.match('[A-Za-zɯɹəɥ→↓↑]',text[-1]):
+    text += '.'
+  return text
